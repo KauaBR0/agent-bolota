@@ -250,7 +250,7 @@ class LLMService {
     if (!this.model) {
       const genAI = this._getGenAI();
       this.model = genAI.getGenerativeModel({
-        model: 'gemini-2.5-pro',
+        model: 'gemini-2.5-flash',
         systemInstruction: SYSTEM_PROMPT,
         tools
       });
@@ -436,7 +436,7 @@ class LLMService {
   getEstatisticas() {
     return {
       sessoesAtivas: this.conversationHistory.size,
-      modelo: 'gemini-2.5-pro',
+      modelo: 'gemini-2.5-flash',
       isWarmedUp: this.isWarmedUp,
       timestamp: new Date().toISOString()
     };
