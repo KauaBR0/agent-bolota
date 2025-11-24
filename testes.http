@@ -1,0 +1,113 @@
+### Bolota API - Exemplos de Teste
+### Use com a extensao REST Client do VS Code ou importe no Postman
+
+### ===========================
+### PRODUTOS (Estoque Local)
+### ===========================
+
+### Listar todos os produtos
+GET http://localhost:3000/api/produtos
+
+###
+
+### Buscar produto por termo
+GET http://localhost:3000/api/produtos/busca?termo=amoxicilina
+
+###
+
+### Buscar produto por ID
+GET http://localhost:3000/api/produtos/1001
+
+###
+
+### Buscar produto indisponivel (Simparic estoque 0)
+GET http://localhost:3000/api/produtos/1003
+
+###
+
+### ===========================
+### PUBMED (Artigos Cientificos)
+### ===========================
+
+### Buscar artigos sobre Amoxicilina
+GET http://localhost:3000/api/pubmed/amoxicilina
+
+###
+
+### Buscar artigos com limite
+GET http://localhost:3000/api/pubmed/apoquel?limite=3
+
+###
+
+### ===========================
+### WEBHOOK DO AGENTE BOLOTA
+### ===========================
+
+### Status do agente
+GET http://localhost:3000/webhook/bolota/status
+
+###
+
+### Fluxo 1: Pergunta inicial sobre Amoxicilina
+POST http://localhost:3000/webhook/bolota
+Content-Type: application/json
+
+{
+  "mensagem": "Me fale sobre Amoxicilina para caes"
+}
+
+###
+
+### Fluxo 2: Confirmar consulta de estoque (usar session_id retornado)
+POST http://localhost:3000/webhook/bolota
+Content-Type: application/json
+
+{
+  "mensagem": "Sim",
+  "session_id": "05f982b6-e3dd-41bd-8a83-c3b9184b02f6"
+}
+
+###
+
+### Teste: Produto indisponivel (Simparic)
+POST http://localhost:3000/webhook/bolota
+Content-Type: application/json
+
+{
+  "mensagem": "Quero saber sobre Simparic"
+}
+
+###
+
+### Teste: Saudacao inicial
+POST http://localhost:3000/webhook/bolota
+Content-Type: application/json
+
+{
+  "mensagem": "Ola"
+}
+
+###
+
+### Teste: Negar consulta de estoque
+POST http://localhost:3000/webhook/bolota
+Content-Type: application/json
+
+{
+  "mensagem": "Nao, obrigado",
+  "session_id": "05f982b6-e3dd-41bd-8a83-c3b9184b02f6"
+}
+
+###
+
+### ===========================
+### OUTROS ENDPOINTS
+### ===========================
+
+### Informacoes da API
+GET http://localhost:3000/
+
+###
+
+### Health check
+GET http://localhost:3000/health
