@@ -1,6 +1,5 @@
 # Dependencias
 node_modules/
-.claude
 
 # Banco de dados
 *.db
