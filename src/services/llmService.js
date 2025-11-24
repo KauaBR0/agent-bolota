@@ -5,6 +5,12 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const produtoService = require('./produtoService');
 const pubmedService = require('./pubmedService');
 
+// Modelos disponiveis (pro primeiro, flash como fallback)
+const MODELS = {
+  PRIMARY: 'gemini-2.5-pro',
+  FALLBACK: 'gemini-2.5-flash'
+};
+
 // System prompt que define a personalidade do Bolota
 const SYSTEM_PROMPT = `Voce e o Bolota, um assistente virtual especializado em medicamentos veterinarios.
 
@@ -93,6 +99,20 @@ function sleep(ms) {
 }
 
 /**
+ * Verifica se e erro de quota/rate limit
+ */
+function isQuotaError(error) {
+  const message = error.message || '';
+  const status = error.status || error.httpStatusCode;
+
+  return status === 429 ||
+         message.includes('429') ||
+         message.includes('quota') ||
+         message.includes('rate') ||
+         message.includes('Too Many Requests');
+}
+
+/**
  * Verifica se o erro e retryable (transiente)
  */
 function isRetryableError(error) {
@@ -104,8 +124,8 @@ function isRetryableError(error) {
     return true;
   }
 
-  // Rate limiting - retry com backoff
-  if (status === 429 || message.includes('429') || message.includes('quota') || message.includes('rate')) {
+  // Rate limiting - retry com backoff (mas nao infinitamente)
+  if (isQuotaError(error)) {
     return true;
   }
 
@@ -156,7 +176,7 @@ async function retryWithBackoff(fn, options = {}) {
       const jitter = Math.random() * 1000; // 0-1s de jitter
       const delay = exponentialDelay + jitter;
 
-      console.log(`[LLM] Tentativa ${attempt + 1} falhou, retry em ${Math.round(delay)}ms: ${error.message}`);
+      console.log(`[LLM] Tentativa ${attempt + 1} falhou, retry em ${Math.round(delay)}ms: ${error.message?.substring(0, 100)}`);
 
       await sleep(delay);
     }
@@ -224,10 +244,12 @@ async function executeTool(functionCall) {
 class LLMService {
   constructor() {
     this.genAI = null;
-    this.model = null;
-    this.conversationHistory = new Map(); // sessionId -> history
+    this.models = {}; // Cache de modelos
+    this.currentModel = MODELS.PRIMARY;
+    this.conversationHistory = new Map(); // sessionId -> { history, model }
     this.sessionLocks = new Map(); // sessionId -> Promise (para evitar race conditions)
     this.isWarmedUp = false;
+    this.modelQuotaExceeded = new Set(); // Modelos com quota excedida
   }
 
   /**
@@ -244,23 +266,51 @@ class LLMService {
   }
 
   /**
-   * Inicializa o modelo Gemini (lazy)
+   * Obtem um modelo especifico
    */
-  _getModel() {
-    if (!this.model) {
+  _getModelByName(modelName) {
+    if (!this.models[modelName]) {
       const genAI = this._getGenAI();
-      this.model = genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
+      this.models[modelName] = genAI.getGenerativeModel({
+        model: modelName,
         systemInstruction: SYSTEM_PROMPT,
         tools
       });
+      console.log(`[LLM] Modelo ${modelName} inicializado`);
     }
-    return this.model;
+    return this.models[modelName];
+  }
+
+  /**
+   * Obtem o melhor modelo disponivel
+   */
+  _getBestAvailableModel() {
+    // Se o modelo primario nao esta com quota excedida, usa ele
+    if (!this.modelQuotaExceeded.has(MODELS.PRIMARY)) {
+      return { model: this._getModelByName(MODELS.PRIMARY), name: MODELS.PRIMARY };
+    }
+
+    // Fallback para o modelo secundario
+    console.log(`[LLM] Usando fallback: ${MODELS.FALLBACK}`);
+    return { model: this._getModelByName(MODELS.FALLBACK), name: MODELS.FALLBACK };
+  }
+
+  /**
+   * Marca modelo como tendo quota excedida (temporariamente)
+   */
+  _markQuotaExceeded(modelName) {
+    this.modelQuotaExceeded.add(modelName);
+    console.log(`[LLM] Modelo ${modelName} marcado como quota excedida`);
+
+    // Limpar flag apos 60 segundos
+    setTimeout(() => {
+      this.modelQuotaExceeded.delete(modelName);
+      console.log(`[LLM] Modelo ${modelName} liberado para uso novamente`);
+    }, 60000);
   }
 
   /**
    * Warmup - inicializa modelo antes de receber requisicoes
-   * Deve ser chamado no startup da aplicacao
    */
   async warmup() {
     if (this.isWarmedUp) return;
@@ -268,11 +318,10 @@ class LLMService {
     try {
       console.log('[LLM] Iniciando warmup...');
 
-      // Inicializar modelo
-      this._getModel();
+      // Inicializar modelo fallback (flash) que tem maior rate limit
+      const model = this._getModelByName(MODELS.FALLBACK);
 
-      // Fazer uma chamada simples para "aquecer" a conexao
-      const chat = this.model.startChat({
+      const chat = model.startChat({
         history: [],
         generationConfig: { maxOutputTokens: 50 }
       });
@@ -286,7 +335,6 @@ class LLMService {
       console.log('[LLM] Warmup concluido com sucesso');
     } catch (error) {
       console.error('[LLM] Erro no warmup (continuando mesmo assim):', error.message);
-      // Nao falhar o startup por causa do warmup
       this.isWarmedUp = true;
     }
   }
@@ -317,100 +365,135 @@ class LLMService {
   }
 
   /**
+   * Processa mensagem internamente com um modelo especifico
+   */
+  async _processWithModel(mensagem, sessionId, modelName) {
+    const model = this._getModelByName(modelName);
+
+    // Recuperar historico da conversa
+    const sessionData = this.conversationHistory.get(sessionId) || { history: [], model: modelName };
+    let history = sessionData.history;
+
+    // Se mudou de modelo, limpar historico (modelos diferentes)
+    if (sessionData.model !== modelName) {
+      console.log(`[LLM] Mudanca de modelo detectada, limpando historico da sessao`);
+      history = [];
+    }
+
+    // Criar chat com historico
+    const chat = model.startChat({
+      history,
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 1024
+      }
+    });
+
+    // Enviar mensagem
+    let result = await chat.sendMessage(mensagem);
+    let response = result.response;
+
+    // Processar function calls se houver
+    let functionCalls = response.functionCalls();
+    let toolResults = [];
+
+    while (functionCalls && functionCalls.length > 0) {
+      // Executar todas as funcoes chamadas
+      for (const fc of functionCalls) {
+        const toolResult = await executeTool(fc);
+        toolResults.push({
+          name: fc.name,
+          result: toolResult
+        });
+      }
+
+      // Enviar resultados das funcoes de volta ao modelo
+      result = await chat.sendMessage(
+        toolResults.map(tr => ({
+          functionResponse: {
+            name: tr.name,
+            response: tr.result
+          }
+        }))
+      );
+
+      response = result.response;
+      functionCalls = response.functionCalls();
+    }
+
+    // Extrair texto da resposta
+    const textoResposta = response.text();
+
+    // Atualizar historico
+    history = await chat.getHistory();
+    this.conversationHistory.set(sessionId, { history, model: modelName });
+
+    return {
+      sucesso: true,
+      resposta: textoResposta,
+      toolsUsadas: toolResults.map(tr => tr.name),
+      modeloUsado: modelName
+    };
+  }
+
+  /**
    * Processa mensagem do usuario usando o Gemini
-   * Com retry, locking e tratamento de erros robusto
+   * Com fallback automatico entre modelos
    */
   async processarMensagem(mensagem, sessionId) {
-    // Adquirir lock para esta sessao
     const releaseLock = await this._acquireLock(sessionId);
 
     try {
-      const model = this._getModel();
+      // Tentar com o modelo primario primeiro
+      const modelsToTry = [MODELS.PRIMARY, MODELS.FALLBACK];
 
-      // Recuperar historico da conversa
-      let history = this.conversationHistory.get(sessionId) || [];
-
-      // Criar chat com historico
-      const chat = model.startChat({
-        history,
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 1024
-        }
-      });
-
-      // Enviar mensagem com retry
-      let result = await retryWithBackoff(async () => {
-        return await chat.sendMessage(mensagem);
-      });
-
-      let response = result.response;
-
-      // Processar function calls se houver
-      let functionCalls = response.functionCalls();
-      let toolResults = [];
-
-      while (functionCalls && functionCalls.length > 0) {
-        // Executar todas as funcoes chamadas
-        for (const fc of functionCalls) {
-          const toolResult = await executeTool(fc);
-          toolResults.push({
-            name: fc.name,
-            result: toolResult
-          });
+      for (const modelName of modelsToTry) {
+        // Pular modelo se quota excedida
+        if (this.modelQuotaExceeded.has(modelName)) {
+          console.log(`[LLM] Pulando ${modelName} (quota excedida)`);
+          continue;
         }
 
-        // Enviar resultados das funcoes de volta ao modelo com retry
-        result = await retryWithBackoff(async () => {
-          return await chat.sendMessage(
-            toolResults.map(tr => ({
-              functionResponse: {
-                name: tr.name,
-                response: tr.result
-              }
-            }))
-          );
-        });
+        try {
+          console.log(`[LLM] Tentando com modelo: ${modelName}`);
 
-        response = result.response;
-        functionCalls = response.functionCalls();
+          const resultado = await retryWithBackoff(async () => {
+            return await this._processWithModel(mensagem, sessionId, modelName);
+          }, { maxRetries: 2, baseDelay: 1000 });
+
+          return resultado;
+
+        } catch (error) {
+          // Se for erro de quota, marcar e tentar proximo modelo
+          if (isQuotaError(error)) {
+            this._markQuotaExceeded(modelName);
+            console.log(`[LLM] Quota excedida para ${modelName}, tentando fallback...`);
+            continue;
+          }
+
+          // Outros erros, propagar
+          throw error;
+        }
       }
 
-      // Extrair texto da resposta
-      const textoResposta = response.text();
-
-      // Atualizar historico (atomico com lock)
-      history = await chat.getHistory();
-      this.conversationHistory.set(sessionId, history);
-
+      // Se chegou aqui, todos os modelos falharam
       return {
-        sucesso: true,
-        resposta: textoResposta,
-        toolsUsadas: toolResults.map(tr => tr.name)
+        sucesso: false,
+        resposta: 'O servico esta temporariamente sobrecarregado. Por favor, aguarde alguns segundos e tente novamente.',
+        erro: 'ALL_MODELS_QUOTA_EXCEEDED'
       };
 
     } catch (error) {
       console.error('[LLM] Erro ao processar mensagem:', error);
 
-      // Erro de API key
       if (error.message?.includes('API_KEY') || error.message?.includes('API key')) {
         return {
           sucesso: false,
-          resposta: 'O agente Bolota precisa de uma chave da API do Gemini configurada. Por favor, configure GEMINI_API_KEY no arquivo .env',
+          resposta: 'O agente Bolota precisa de uma chave da API do Gemini configurada.',
           erro: 'API_KEY_MISSING'
         };
       }
 
-      // Erro de rate limiting
-      if (error.message?.includes('429') || error.message?.includes('quota')) {
-        return {
-          sucesso: false,
-          resposta: 'O servico esta temporariamente sobrecarregado. Por favor, aguarde alguns segundos e tente novamente.',
-          erro: 'RATE_LIMITED'
-        };
-      }
-
-      // Erro generico
       return {
         sucesso: false,
         resposta: 'Desculpe, ocorreu um erro ao processar sua mensagem. Tente novamente.',
@@ -418,7 +501,6 @@ class LLMService {
       };
 
     } finally {
-      // SEMPRE liberar o lock
       this._releaseLock(sessionId, releaseLock);
     }
   }
@@ -436,7 +518,9 @@ class LLMService {
   getEstatisticas() {
     return {
       sessoesAtivas: this.conversationHistory.size,
-      modelo: 'gemini-2.5-flash',
+      modeloPrimario: MODELS.PRIMARY,
+      modeloFallback: MODELS.FALLBACK,
+      modelosComQuotaExcedida: Array.from(this.modelQuotaExceeded),
       isWarmedUp: this.isWarmedUp,
       timestamp: new Date().toISOString()
     };
