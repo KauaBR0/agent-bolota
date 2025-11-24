@@ -16,6 +16,9 @@ const swaggerSpec = require('./config/swagger');
 const { getDatabase, closeDatabase, queryOne } = require('./config/database');
 const { loadCSVToDatabase } = require('./utils/csvLoader');
 
+// LLM Service para warmup
+const llmService = require('./services/llmService');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -117,6 +120,10 @@ async function iniciar() {
     } else {
       console.log(`Banco de dados ja contem ${count.total} produtos.`);
     }
+
+    // Warmup do LLM (pre-inicializa conexao com Gemini)
+    console.log('Inicializando LLM (warmup)...');
+    await llmService.warmup();
 
     // Iniciar servidor
     app.listen(PORT, () => {

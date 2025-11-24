@@ -9,14 +9,41 @@ class PubmedService {
   }
 
   /**
+   * Normaliza o termo de busca, extraindo apenas o nome do medicamento
+   */
+  _normalizarTermo(termo) {
+    // Remover frases comuns em portugues
+    let normalizado = termo
+      .toLowerCase()
+      .replace(/\s+para\s+(caes|cachorros?|gatos?|felinos?|animais?|pets?|aves?|cavalos?|equinos?|bovinos?|suinos?)/gi, '')
+      .replace(/\s+em\s+(caes|cachorros?|gatos?|felinos?|animais?|pets?)/gi, '')
+      .replace(/\s+veterinari[oa]?/gi, '')
+      .replace(/\s+animal/gi, '')
+      .replace(/\s+uso\s+veterinario/gi, '')
+      .trim();
+
+    // Se ficou muito curto, usar o original
+    if (normalizado.length < 3) {
+      normalizado = termo.trim();
+    }
+
+    console.log(`[PubMed] Termo original: "${termo}" -> Normalizado: "${normalizado}"`);
+    return normalizado;
+  }
+
+  /**
    * Busca artigos relacionados a um medicamento veterinario
    * @param {string} medicamento - Nome do medicamento
    * @param {number} maxResults - Numero maximo de resultados (default: 5)
    */
   async buscarArtigos(medicamento, maxResults = 5) {
     try {
+      // Normalizar o termo (remover "para cães", etc)
+      const termoNormalizado = this._normalizarTermo(medicamento);
+
       // Passo 1: Buscar IDs dos artigos
-      const termoBusca = `${medicamento} veterinary OR ${medicamento} animal`;
+      const termoBusca = `${termoNormalizado} veterinary OR ${termoNormalizado} animal`;
+      console.log(`[PubMed] Buscando: "${termoBusca}"`);
       const ids = await this._searchArticleIds(termoBusca, maxResults);
 
       if (ids.length === 0) {
