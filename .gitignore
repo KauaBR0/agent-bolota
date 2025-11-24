@@ -9,6 +9,8 @@ node_modules/
 
 # Variaveis de ambiente
 .env
+.env.local
+.gitignore
 
 # Logs
 *.log
